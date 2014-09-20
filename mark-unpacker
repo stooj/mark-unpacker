@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+#
+# 
+#
+#set -xv
+
+#TODO - save to target directory
+LOGFILE=$HOME/marking-log
+
+# Wooledge spinner
+# http://mywiki.wooledge.org/BashFAQ/034
+sp="/-\|"
+sc=0
+spin() {
+   printf "\b%s" "${sp:sc++:1}"
+   ((sc==${#sp})) && sc=0
+}
+endspin() {
+   printf "\r%s\n" "$@"
+}
+
+# Check the number of arguments are correct (must be at least 1)
+
+if [[ $# -eq 0 ]]; then
+    echo "Please provide the location of the submission archives" | tee -a "$LOGFILE"
+    exit 1
+fi
+
+# Take in the source directory, stripping any trailing slashes
+shopt -s extglob
+srcdir=${1%%*(/)}
+
+# Take in the target directory
+if [[ $# -eq 2 ]]; then
+    targetdir=${2%%*(/)}
+else
+    targetdir="$srcdir/output"
+fi
+shopt -u extglob
+
+echo "Logfile: $LOGFILE"
+echo "Source: $srcdir"
+echo "Target: $targetdir"
+echo ""
+
+# Check the target directory exists
+if ! [[ -d "$targetdir" ]]; then
+    read -p "$targetdir does not exist. Shall I create it? [Y/n] " ans
+    if [[ $ans = "y" ]] || [[ $ans = "Y" ]] || [[ $ans = "" ]]; then
+        mkdir -p "$targetdir"
+        echo ""
+    else
+        echo "Nowhere to put the files. Exiting" | tee -a "$LOGFILE"
+        exit 1
+    fi
+fi
+
+# Get the last, on-time submitted file
+# TODO - find some other way of working out the close time for the submission
+#        This relies too much on human nature (there's always someone who
+#        leaves it until the absolute last minute)
+lastsubmission=$(ls -tr --group-directories-first "$srcdir" | tail -n1)
+lastsubmissiontime=$(stat -c %Y "${srcdir}/${lastsubmission}")
+
+# Unzip all the submissions and put them in their own folder.
+printf "%-75s" "Unzipping submissions"
+while IFS= read -r file; do
+    spin
+    if ! $(file -n "$file" 2>&1 | grep -q "Zip archive data") ; then
+        # Don't include the dump directory or srcdir itself itself
+        if ! [[ "${file##*/}" = "dump" || "${file}" = "${srcdir}" ]]; then
+            echo "\"$file\" is not a zip file. Ignoring" >> "$LOGFILE"
+        fi
+    else
+        filename=${file##*/}
+        unzip -q -d "${targetdir}/${filename%.zip}" "$file" 2> /dev/null
+        if [[ $? -ne 0 ]]; then
+            echo "\"$file\" was not extracted correctly." >> "$LOGFILE"
+        fi
+    fi
+done < <(find "$srcdir" -name '*' -print)
+endspin
+
+printf "%-75s" "Checking for late submissions"
+while IFS= read -r file; do
+    spin
+    # Only check if submission was extracted correctly
+    if [[ -d "${targetdir}/${filename%.zip}" ]]; then
+        if [[ $file = *dump* ]]; then
+            submissiontime=$(stat -c %Y "$file")
+            diff=$(($submissiontime-$lastsubmissiontime))
+            if [[ $diff -gt 0 ]]; then 
+                dayslate=$((diff / 60 / 60 / 24))
+                hourslate=$(( ($diff / 60 / 60) - ( $dayslate * 24) ))
+                minuteslate=$(( ($diff / 60) - ( ($dayslate * 24 + $hourslate) * 60) ))
+                touch "${targetdir}/${filename%.zip}/submitted_${dayslate}_days_${hourslate}_hours_${minuteslate}_minutes_late"
+                echo "\"${filename%.zip}\" submitted late (${dayslate} days, ${hourslate} hours, ${minuteslate} minutes)" >> "$LOGFILE"
+            fi
+        fi
+    fi
+done < <(find "$srcdir" -name '*' -print)
+endspin
+
+printf "%-75s" "Checking for directories"
+for dir in "$targetdir"/*; do
+    for submission in "$dir"/*; do
+        spin
+        if [[ -d "$submission" ]]; then
+            if [[ "${submission##*/}" = "__MACOSX" ]]; then
+                rm -r "$submission"
+            else
+                touch "${dir}/submitted_directory"
+                echo "\"${dir}\" submitted directory" >> "$LOGFILE"
+                find "$submission" -type f -exec mv -n {} "$dir" \;
+                rmdir "$submission" 2> /dev/null
+            fi
+        fi
+    done
+done
+endspin
+
+printf "%-75s" "Checking for executables and object files"
+while IFS= read -r file; do
+    spin
+
+    filetype=$(file -n "$file" 2>&1)
+    if $(echo "$filetype" | grep -q "executable") ; then
+        touch "${file%/*}/submitted_binary"
+        echo "\"${file%/*}\" contains a binary (\"${file##*/}\")" >> "$LOGFILE"
+        rm "$file"
+    fi
+
+    if $(echo "$filetype" | grep -q "relocatable") ; then
+        touch "${file%/*}/submitted_object_file"
+        echo "\"${file%/*}\" contains a binary (\"${file##*/}\")" >> "$LOGFILE"
+        rm "$file"
+    fi
+
+done < <(find "$targetdir" -name '*' -print)
+
+endspin
